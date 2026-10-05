@@ -266,7 +266,7 @@ fun ReceiveScreen(state: FluxState) {
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    state.address.ifEmpty { "…" },
+                    state.addresses.firstOrNull() ?: "…",
                     color = Palette.accent,
                     fontSize = 26.sp,
                     fontWeight = FontWeight.Bold,
@@ -278,6 +278,7 @@ fun ReceiveScreen(state: FluxState) {
                 Text("Waiting for sender", color = Palette.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
             Text("Type this address on the sender's device.", color = Palette.muted, fontSize = 14.sp)
+            state.addresses.drop(1).forEach { Text("or $it", color = Palette.muted, fontSize = 14.sp) }
             state.recent.firstOrNull { it.startsWith("Received") }?.let {
                 Text(it, color = Palette.accent, fontSize = 15.sp)
             }

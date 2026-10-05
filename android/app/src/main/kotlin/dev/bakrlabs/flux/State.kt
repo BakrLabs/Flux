@@ -26,7 +26,7 @@ class Item(val name: String) {
 class FluxState(private val context: Context, private val scope: CoroutineScope) {
     var screen by mutableStateOf(Screen.Home)
     var target by mutableStateOf("")
-    var address by mutableStateOf("")
+    var addresses by mutableStateOf<List<String>>(emptyList())
     var speed by mutableStateOf("")
     var error by mutableStateOf<String?>(null)
     val picked = mutableStateListOf<Picked>()
@@ -80,7 +80,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
 
     fun startReceiving() {
         screen = Screen.Receive
-        address = ""
+        addresses = emptyList()
         error = null
         receiving?.cancel()
         receiving = scope.launch(Dispatchers.IO) {
@@ -90,7 +90,8 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                 error = e.message
                 return@launch
             }
-            address = "${FluxCore.localIp().ifEmpty { "?" }}:$port"
+            val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
+            addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
             val dir = (context.getExternalFilesDir("Flux") ?: context.filesDir).path
             while (isActive) {
                 try {
