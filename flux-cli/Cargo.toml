@@ -1,0 +1,13 @@
+[package]
+name = "flux-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+flux-core = { path = "../flux-core" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
