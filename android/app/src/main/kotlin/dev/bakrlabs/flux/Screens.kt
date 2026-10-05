@@ -37,6 +37,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -133,6 +134,29 @@ private fun Tab(label: String, selected: Boolean, modifier: Modifier) {
 }
 
 @Composable
+private fun SectionHeader(label: String, action: String? = null, onAction: () -> Unit = {}) {
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, color = Palette.muted, fontSize = 13.sp)
+        if (action != null) {
+            Text(
+                action,
+                color = Palette.accent,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(onClick = onAction)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
+        }
+    }
+}
+
+@Composable
 private fun DeviceRow(name: String, host: String, selected: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Row(
@@ -145,10 +169,64 @@ private fun DeviceRow(name: String, host: String, selected: Boolean, onClick: ()
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(name, color = Palette.text, fontSize = 15.sp)
-        Text(host, color = Palette.muted, fontSize = 13.sp)
+        Box(
+            Modifier.size(20.dp).clip(CircleShape).border(2.dp, if (selected) Palette.accent else Palette.border, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) Box(Modifier.size(10.dp).clip(CircleShape).background(Palette.accent))
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(name, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Text(host, color = Palette.muted, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
+    }
+}
+
+@Composable
+private fun FileRow(name: String, onRemove: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Palette.card)
+            .padding(start = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(Palette.border),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                name.substringAfterLast('.', "").take(4).uppercase().ifEmpty { "FILE" },
+                color = Palette.muted,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(name, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Box(
+            Modifier.size(48.dp).clickable(onClickLabel = "Remove $name", onClick = onRemove),
+            contentAlignment = Alignment.Center,
+        ) { Text("✕", color = Palette.muted, fontSize = 16.sp) }
+    }
+}
+
+@Composable
+private fun ReceivedRow(name: String, onOpen: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Palette.card)
+            .clickable(onClickLabel = "Open $name", onClick = onOpen)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(name, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Text("Open", color = Palette.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
     }
 }
 
@@ -164,8 +242,8 @@ private fun Row2(left: String, right: String, rightColor: Color = Palette.muted)
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(left, color = Palette.text, fontSize = 15.sp)
-        Text(right, color = rightColor, fontSize = 13.sp)
+        Text(left, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Text(right, color = rightColor, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
     }
 }
 
@@ -220,6 +298,7 @@ fun HomeScreen(state: FluxState) {
 @Composable
 fun SendScreen(state: FluxState, pick: () -> Unit) {
     LaunchedEffect(Unit) { state.discover() }
+    val chosen = state.devices.firstOrNull { "${it.host}:${it.port}" == state.target }
     Page {
         TopBar("Send") { state.screen = Screen.Home }
         Row(
@@ -233,17 +312,24 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
             Tab("Files", true, Modifier.weight(1f))
             Tab("Apps", false, Modifier.weight(1f))
         }
-        PillButton("Pick files", pick, Modifier.fillMaxWidth(), filled = false)
-        Text("Nearby", color = Palette.muted, fontSize = 13.sp)
-        if (state.devices.isEmpty()) {
-            Text("Looking for devices. Open Receive on the other phone.", color = Palette.muted, fontSize = 14.sp)
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SectionHeader("Send to")
+            if (state.devices.isEmpty()) {
+                Text("Looking for devices. Open Receive on the other phone.", color = Palette.muted, fontSize = 14.sp)
+            }
+            state.devices.take(3).forEach { device ->
+                val address = "${device.host}:${device.port}"
+                DeviceRow(device.name, device.host, address == state.target) { state.target = address }
+            }
         }
-        state.devices.take(3).forEach { device ->
-            val address = "${device.host}:${device.port}"
-            DeviceRow(device.name, device.host, address == state.target) { state.target = address }
-        }
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(state.picked) { Row2(it.name, "Selected", Palette.accent) }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SectionHeader("Files (${state.picked.size})", "+ Add", pick)
+            if (state.picked.isEmpty()) {
+                Text("Nothing selected yet.", color = Palette.muted, fontSize = 14.sp)
+            }
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.picked) { file -> FileRow(file.name) { state.picked.remove(file) } }
+            }
         }
         TextField(
             value = state.target,
@@ -265,7 +351,14 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
             ),
         )
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("${state.picked.size} selected", color = Palette.muted, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            Text(
+                chosen?.let { "To ${it.name}" } ?: "${state.picked.size} selected",
+                color = Palette.muted,
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
             PillButton(
                 "Send",
                 { state.send() },
@@ -309,8 +402,11 @@ fun ReceiveScreen(state: FluxState) {
             }
             Text("Open Send on the other phone, or type this address.", color = Palette.muted, fontSize = 14.sp)
             state.addresses.drop(1).forEach { Text("or $it", color = Palette.muted, fontSize = 14.sp) }
-            state.recent.firstOrNull { it.startsWith("Received") }?.let {
-                Text(it, color = Palette.accent, fontSize = 15.sp)
+            if (state.received.isNotEmpty()) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SectionHeader("Received, saved in Download/Flux")
+                    state.received.take(4).forEach { item -> ReceivedRow(item.name) { state.open(item) } }
+                }
             }
             state.error?.let { Text(it, color = Palette.danger, fontSize = 13.sp) }
         }

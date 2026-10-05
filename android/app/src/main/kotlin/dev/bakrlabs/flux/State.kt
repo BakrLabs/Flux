@@ -1,10 +1,16 @@
 package dev.bakrlabs.flux
 
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -18,10 +24,13 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 
 enum class Screen { Home, Send, Receive, Progress }
 
 class Picked(val uri: Uri, val name: String)
+
+class Received(val name: String, val uri: Uri, val mime: String)
 
 class Item(val name: String) {
     var status by mutableStateOf("Queued")
@@ -37,6 +46,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val transfers = mutableStateListOf<Item>()
     val recent = mutableStateListOf<String>()
     val devices = mutableStateListOf<Device>()
+    val received = mutableStateListOf<Received>()
     private var receiving: Job? = null
 
     fun addPicked(uris: List<Uri>) {
@@ -114,6 +124,39 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         if (index >= 0) devices[index] = found else devices.add(found)
     }
 
+    private fun publish(source: File): Received {
+        val extension = source.extension.lowercase()
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, source.name)
+            put(MediaStore.Downloads.MIME_TYPE, mime)
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Flux")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("could not create the file in Downloads")
+        resolver.openOutputStream(uri)!!.use { out ->
+            source.inputStream().use { it.copyTo(out) }
+        }
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+        source.delete()
+        return Received(source.name, uri, mime)
+    }
+
+    fun open(item: Received) {
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(item.uri, item.mime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            context.startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            error = "No app can open ${item.name}"
+        }
+    }
+
     fun startReceiving() {
         screen = Screen.Receive
         addresses = emptyList()
@@ -129,11 +172,13 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
             val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
             addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
             launch { announce(Build.MODEL, port) }
-            val dir = (context.getExternalFilesDir("Flux") ?: context.filesDir).path
+            val dir = File(context.cacheDir, "incoming").apply { mkdirs() }.path
             while (isActive) {
                 try {
-                    val saved = FluxCore.receiveOne(dir)
-                    recent.add(0, "Received ${File(saved).name}")
+                    val saved = File(FluxCore.receiveOne(dir))
+                    val item = publish(saved)
+                    received.add(0, item)
+                    recent.add(0, "Received ${item.name}")
                 } catch (e: Exception) {
                     error = e.message
                     delay(500)
