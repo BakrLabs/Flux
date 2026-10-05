@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["flux-core", "flux-cli"]
+members = ["flux-core", "flux-cli", "flux-android"]
