@@ -2,6 +2,8 @@ package dev.bakrlabs.flux
 
 import android.content.Context
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -12,7 +14,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 enum class Screen { Home, Send, Receive, Progress }
@@ -32,6 +36,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val picked = mutableStateListOf<Picked>()
     val transfers = mutableStateListOf<Item>()
     val recent = mutableStateListOf<String>()
+    val devices = mutableStateListOf<Device>()
     private var receiving: Job? = null
 
     fun addPicked(uris: List<Uri>) {
@@ -78,6 +83,37 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         }
     }
 
+    suspend fun discover() {
+        devices.clear()
+        val wifi = context.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val lock = wifi?.createMulticastLock("flux")?.apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        try {
+            coroutineScope {
+                launch {
+                    try {
+                        listen { found -> withContext(Dispatchers.Main) { upsert(found) } }
+                    } catch (e: java.io.IOException) {
+                        error = e.message
+                    }
+                }
+                while (isActive) {
+                    delay(1000)
+                    devices.removeAll { System.currentTimeMillis() - it.seen > 4000 }
+                }
+            }
+        } finally {
+            lock?.release()
+        }
+    }
+
+    private fun upsert(found: Device) {
+        val index = devices.indexOfFirst { it.host == found.host && it.port == found.port }
+        if (index >= 0) devices[index] = found else devices.add(found)
+    }
+
     fun startReceiving() {
         screen = Screen.Receive
         addresses = emptyList()
@@ -92,6 +128,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
             }
             val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
             addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
+            launch { announce(Build.MODEL, port) }
             val dir = (context.getExternalFilesDir("Flux") ?: context.filesDir).path
             while (isActive) {
                 try {

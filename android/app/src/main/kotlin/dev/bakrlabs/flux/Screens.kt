@@ -27,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -132,6 +133,26 @@ private fun Tab(label: String, selected: Boolean, modifier: Modifier) {
 }
 
 @Composable
+private fun DeviceRow(name: String, host: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(shape)
+            .background(Palette.card)
+            .border(1.dp, if (selected) Palette.accent else Palette.border, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(name, color = Palette.text, fontSize = 15.sp)
+        Text(host, color = Palette.muted, fontSize = 13.sp)
+    }
+}
+
+@Composable
 private fun Row2(left: String, right: String, rightColor: Color = Palette.muted) {
     Row(
         Modifier
@@ -180,7 +201,7 @@ fun HomeScreen(state: FluxState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(Palette.accent))
                 Spacer(Modifier.width(8.dp))
-                Text("Auto-discovery comes next", color = Palette.text, fontSize = 14.sp)
+                Text("Devices appear when you open Send", color = Palette.text, fontSize = 14.sp)
             }
             Canvas(Modifier.fillMaxWidth().height(150.dp)) {
                 listOf(30.dp, 52.dp, 73.dp).forEach {
@@ -198,6 +219,7 @@ fun HomeScreen(state: FluxState) {
 
 @Composable
 fun SendScreen(state: FluxState, pick: () -> Unit) {
+    LaunchedEffect(Unit) { state.discover() }
     Page {
         TopBar("Send") { state.screen = Screen.Home }
         Row(
@@ -212,6 +234,14 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
             Tab("Apps", false, Modifier.weight(1f))
         }
         PillButton("Pick files", pick, Modifier.fillMaxWidth(), filled = false)
+        Text("Nearby", color = Palette.muted, fontSize = 13.sp)
+        if (state.devices.isEmpty()) {
+            Text("Looking for devices. Open Receive on the other phone.", color = Palette.muted, fontSize = 14.sp)
+        }
+        state.devices.take(3).forEach { device ->
+            val address = "${device.host}:${device.port}"
+            DeviceRow(device.name, device.host, address == state.target) { state.target = address }
+        }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(state.picked) { Row2(it.name, "Selected", Palette.accent) }
         }
@@ -219,7 +249,7 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
             value = state.target,
             onValueChange = { state.target = it },
             singleLine = true,
-            placeholder = { Text("Receiver address, e.g. 192.168.1.5:41234") },
+            placeholder = { Text("Or type an address, e.g. 192.168.1.5:41234") },
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier.fillMaxWidth(),
             colors = TextFieldDefaults.colors(
@@ -277,7 +307,7 @@ fun ReceiveScreen(state: FluxState) {
                 Spacer(Modifier.width(8.dp))
                 Text("Waiting for sender", color = Palette.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
-            Text("Type this address on the sender's device.", color = Palette.muted, fontSize = 14.sp)
+            Text("Open Send on the other phone, or type this address.", color = Palette.muted, fontSize = 14.sp)
             state.addresses.drop(1).forEach { Text("or $it", color = Palette.muted, fontSize = 14.sp) }
             state.recent.firstOrNull { it.startsWith("Received") }?.let {
                 Text(it, color = Palette.accent, fontSize = 15.sp)
