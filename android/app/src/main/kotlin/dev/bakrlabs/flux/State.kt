@@ -18,9 +18,9 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -41,6 +41,12 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     var target by mutableStateOf("")
     var addresses by mutableStateOf<List<String>>(emptyList())
     var speed by mutableStateOf("")
+    var eta by mutableStateOf("")
+    var progress by mutableStateOf(0f)
+    var sending by mutableStateOf(false)
+    var paused by mutableStateOf(false)
+    var incomingName by mutableStateOf("")
+    var incomingFraction by mutableStateOf(0f)
     var error by mutableStateOf<String?>(null)
     val picked = mutableStateListOf<Picked>()
     val transfers = mutableStateListOf<Item>()
@@ -48,6 +54,12 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val devices = mutableStateListOf<Device>()
     val received = mutableStateListOf<Received>()
     private var receiving: Job? = null
+
+    @Volatile
+    private var cancelRequested = false
+
+    @Volatile
+    private var currentFile = 0
 
     fun addPicked(uris: List<Uri>) {
         uris.forEach { picked.add(Picked(it, displayName(it))) }
@@ -67,30 +79,97 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         transfers.clear()
         files.forEach { transfers.add(Item(it.name)) }
         speed = ""
+        eta = ""
         error = null
+        progress = 0f
+        paused = false
+        sending = true
+        cancelRequested = false
+        currentFile = 0
+        FluxCore.reset(0)
         screen = Screen.Progress
         scope.launch(Dispatchers.IO) {
-            files.forEachIndexed { index, file ->
-                val item = transfers[index]
-                item.status = "Sending"
-                try {
-                    val local = File(context.cacheDir, file.name)
-                    context.contentResolver.openInputStream(file.uri)!!.use { input ->
-                        local.outputStream().use { input.copyTo(it) }
+            val ticker = launch { trackSend(files.size) }
+            try {
+                files.forEachIndexed { index, file ->
+                    val item = transfers[index]
+                    if (cancelRequested) {
+                        item.status = "Cancelled"
+                        return@forEachIndexed
                     }
-                    val started = System.nanoTime()
-                    val bytes = FluxCore.sendFile(addr, local.path)
-                    val seconds = (System.nanoTime() - started) / 1e9
-                    speed = "%.1f MB/s".format(bytes / seconds / 1e6)
-                    item.status = "Done"
-                    recent.add(0, "Sent ${file.name}")
-                    local.delete()
-                } catch (e: Exception) {
-                    item.status = "Failed"
-                    error = e.message
+                    currentFile = index
+                    item.status = "Preparing"
+                    val local = File(context.cacheDir, file.name)
+                    try {
+                        context.contentResolver.openInputStream(file.uri)!!.use { input ->
+                            local.outputStream().use { input.copyTo(it) }
+                        }
+                        item.status = "Sending"
+                        val started = System.nanoTime()
+                        val bytes = FluxCore.sendFile(addr, local.path)
+                        val seconds = (System.nanoTime() - started) / 1e9
+                        speed = "%.1f MB/s".format(bytes / seconds / 1e6)
+                        item.status = "Done"
+                        recent.add(0, "Sent ${file.name}")
+                    } catch (e: Exception) {
+                        if (cancelRequested) {
+                            item.status = "Cancelled"
+                        } else {
+                            item.status = "Failed"
+                            error = e.message
+                        }
+                    } finally {
+                        local.delete()
+                    }
                 }
+            } finally {
+                ticker.cancel()
+                sending = false
+                paused = false
+                eta = ""
+                if (transfers.isNotEmpty() && transfers.all { it.status == "Done" }) progress = 1f
             }
         }
+    }
+
+    private suspend fun trackSend(count: Int) {
+        var lastDone = 0L
+        var lastTime = System.nanoTime()
+        var smooth = 0.0
+        while (true) {
+            delay(200)
+            val done = FluxCore.progressDone(0)
+            val total = FluxCore.progressTotal(0)
+            val now = System.nanoTime()
+            val seconds = (now - lastTime) / 1e9
+            val delta = done - lastDone
+            lastDone = done
+            lastTime = now
+            val active = transfers.getOrNull(currentFile)?.status == "Sending"
+            val within = if (active && total > 0) done.toFloat() / total else 0f
+            progress = ((currentFile + within) / count).coerceIn(0f, 1f)
+            if (paused) {
+                speed = "Paused"
+                eta = ""
+            } else if (active && delta > 0) {
+                val instant = delta / seconds
+                smooth = if (smooth == 0.0) instant else smooth * 0.7 + instant * 0.3
+                speed = "%.1f MB/s".format(smooth / 1e6)
+                eta = clock(((total - done) / smooth).toLong())
+            }
+        }
+    }
+
+    private fun clock(seconds: Long) = "%d:%02d".format(seconds / 60, seconds % 60)
+
+    fun togglePause() {
+        paused = !paused
+        FluxCore.setPaused(0, paused)
+    }
+
+    fun cancelSend() {
+        cancelRequested = true
+        FluxCore.cancel(0)
     }
 
     suspend fun discover() {
@@ -105,7 +184,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                 launch {
                     try {
                         listen { found -> withContext(Dispatchers.Main) { upsert(found) } }
-                    } catch (e: java.io.IOException) {
+                    } catch (e: IOException) {
                         error = e.message
                     }
                 }
@@ -161,8 +240,13 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         screen = Screen.Receive
         addresses = emptyList()
         error = null
-        receiving?.cancel()
+        incomingName = ""
+        val previous = receiving
+        previous?.cancel()
+        FluxCore.cancel(1)
         receiving = scope.launch(Dispatchers.IO) {
+            previous?.join()
+            FluxCore.reset(1)
             val port = try {
                 FluxCore.bindReceiver()
             } catch (e: Exception) {
@@ -172,6 +256,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
             val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
             addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
             launch { announce(Build.MODEL, port) }
+            launch { trackReceive() }
             val dir = File(context.cacheDir, "incoming").apply { mkdirs() }.path
             while (isActive) {
                 try {
@@ -180,9 +265,25 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                     received.add(0, item)
                     recent.add(0, "Received ${item.name}")
                 } catch (e: Exception) {
-                    error = e.message
-                    delay(500)
+                    if (isActive) {
+                        error = e.message
+                        delay(500)
+                    }
                 }
+            }
+        }
+    }
+
+    private suspend fun trackReceive() {
+        while (true) {
+            delay(200)
+            val total = FluxCore.progressTotal(1)
+            val done = FluxCore.progressDone(1)
+            if (total > 0 && done < total) {
+                incomingName = FluxCore.progressName(1)
+                incomingFraction = done.toFloat() / total
+            } else {
+                incomingName = ""
             }
         }
     }
@@ -190,6 +291,8 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     fun stopReceiving() {
         receiving?.cancel()
         receiving = null
+        FluxCore.cancel(1)
+        incomingName = ""
         screen = Screen.Home
     }
 }

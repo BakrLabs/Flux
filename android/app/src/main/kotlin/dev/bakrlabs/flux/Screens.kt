@@ -78,6 +78,7 @@ private fun PillButton(
     modifier: Modifier = Modifier,
     filled: Boolean = true,
     enabled: Boolean = true,
+    contentColor: Color? = null,
 ) {
     val shape = RoundedCornerShape(26.dp)
     val background = if (filled) Palette.accent else Palette.card
@@ -92,7 +93,7 @@ private fun PillButton(
     ) {
         Text(
             text,
-            color = if (filled) Palette.onAccent else Palette.text,
+            color = contentColor ?: if (filled) Palette.onAccent else Palette.text,
             fontSize = 16.sp,
             fontWeight = FontWeight.Bold,
         )
@@ -231,6 +232,38 @@ private fun ReceivedRow(name: String, onOpen: () -> Unit) {
 }
 
 @Composable
+private fun ProgressBar(fraction: Float) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(6.dp)
+            .clip(RoundedCornerShape(3.dp))
+            .background(Palette.track),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth(fraction.coerceIn(0f, 1f))
+                .height(6.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(Palette.accent),
+        )
+    }
+}
+
+@Composable
+private fun StatCard(label: String, value: String, modifier: Modifier) {
+    Column(
+        modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Palette.card)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Text(label, color = Palette.muted, fontSize = 12.sp)
+        Text(value, color = Palette.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
 private fun Row2(left: String, right: String, rightColor: Color = Palette.muted) {
     Row(
         Modifier
@@ -257,6 +290,20 @@ fun HomeScreen(state: FluxState) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             BigCard("Send", "↗", true, Modifier.weight(1f)) { state.screen = Screen.Send }
             BigCard("Receive", "↙", false, Modifier.weight(1f)) { state.startReceiving() }
+        }
+        if (state.sending) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Palette.card)
+                    .clickable { state.screen = Screen.Progress }
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Transfer in progress", color = Palette.text, fontSize = 15.sp)
+                Text("View", color = Palette.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
         }
         Row(
             Modifier
@@ -363,7 +410,7 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
                 "Send",
                 { state.send() },
                 Modifier.width(140.dp),
-                enabled = state.picked.isNotEmpty() && state.target.isNotBlank(),
+                enabled = state.picked.isNotEmpty() && state.target.isNotBlank() && !state.sending,
             )
         }
     }
@@ -398,10 +445,26 @@ fun ReceiveScreen(state: FluxState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(Palette.accent))
                 Spacer(Modifier.width(8.dp))
-                Text("Waiting for sender", color = Palette.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text(if (state.incomingName.isEmpty()) "Waiting for sender" else "Receiving", color = Palette.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
             Text("Open Send on the other phone, or type this address.", color = Palette.muted, fontSize = 14.sp)
             state.addresses.drop(1).forEach { Text("or $it", color = Palette.muted, fontSize = 14.sp) }
+            if (state.incomingName.isNotEmpty()) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Palette.card)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(state.incomingName, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        Text("${(state.incomingFraction * 100).toInt()}%", color = Palette.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
+                    }
+                    ProgressBar(state.incomingFraction)
+                }
+            }
             if (state.received.isNotEmpty()) {
                 Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     SectionHeader("Received, saved in Download/Flux")
@@ -418,7 +481,7 @@ fun ReceiveScreen(state: FluxState) {
 fun ProgressScreen(state: FluxState) {
     val total = state.transfers.size
     val done = state.transfers.count { it.status == "Done" }
-    val fraction = if (total == 0) 0f else done.toFloat() / total
+    val fraction = state.progress
     Page {
         TopBar("Sending") { state.screen = Screen.Home }
         Column(
@@ -440,15 +503,9 @@ fun ProgressScreen(state: FluxState) {
                     Text("$done of $total files", color = Palette.muted, fontSize = 13.sp)
                 }
             }
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Palette.card)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-            ) {
-                Text("Speed", color = Palette.muted, fontSize = 12.sp)
-                Text(state.speed.ifEmpty { "—" }, color = Palette.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                StatCard("Speed", state.speed.ifEmpty { "—" }, Modifier.weight(1f))
+                StatCard("Time left", state.eta.ifEmpty { "—" }, Modifier.weight(1f))
             }
         }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -462,6 +519,13 @@ fun ProgressScreen(state: FluxState) {
             }
         }
         state.error?.let { Text(it, color = Palette.danger, fontSize = 13.sp) }
-        PillButton("Done", { state.screen = Screen.Home }, Modifier.fillMaxWidth(), filled = false)
+        if (state.sending) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                PillButton(if (state.paused) "Resume" else "Pause", { state.togglePause() }, Modifier.weight(1f), filled = false)
+                PillButton("Cancel", { state.cancelSend() }, Modifier.weight(1f), filled = false, contentColor = Palette.danger)
+            }
+        } else {
+            PillButton("Done", { state.screen = Screen.Home }, Modifier.fillMaxWidth(), filled = false)
+        }
     }
 }
