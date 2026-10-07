@@ -9,6 +9,7 @@ object FluxCore {
     external fun bindReceiver(): Int
     external fun receiveOne(outDir: String): String
     external fun sendFile(addr: String, path: String): Long
+    external fun sendFd(addr: String, name: String, size: Long, fd: Int): Long
     external fun progressDone(channel: Int): Long
     external fun progressTotal(channel: Int): Long
     external fun progressName(channel: Int): String

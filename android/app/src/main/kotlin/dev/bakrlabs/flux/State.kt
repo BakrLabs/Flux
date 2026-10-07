@@ -4,10 +4,12 @@ import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
@@ -25,10 +27,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 enum class Screen { Home, Send, Receive, Progress }
 
-class Picked(val uri: Uri, val name: String)
+class AppEntry(val label: String, val packageName: String, val apks: List<File>) {
+    val fileName: String
+        get() = label.replace(Regex("""[\\/:*?"<>|]"""), "_") + if (apks.size == 1) ".apk" else ".apks"
+}
+
+class Picked(val name: String, val uri: Uri? = null, val app: AppEntry? = null)
+
+private class Source(val pfd: ParcelFileDescriptor, val name: String, val size: Long)
 
 class Received(val name: String, val uri: Uri, val mime: String)
 
@@ -53,6 +65,8 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val recent = mutableStateListOf<String>()
     val devices = mutableStateListOf<Device>()
     val received = mutableStateListOf<Received>()
+    val apps = mutableStateListOf<AppEntry>()
+    var tab by mutableStateOf(0)
     private var receiving: Job? = null
 
     @Volatile
@@ -62,7 +76,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     private var currentFile = 0
 
     fun addPicked(uris: List<Uri>) {
-        uris.forEach { picked.add(Picked(it, displayName(it))) }
+        uris.forEach { picked.add(Picked(displayName(it), uri = it)) }
     }
 
     private fun displayName(uri: Uri): String {
@@ -99,14 +113,12 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                     }
                     currentFile = index
                     item.status = "Preparing"
-                    val local = File(context.cacheDir, file.name)
+                    val scratch = mutableListOf<File>()
                     try {
-                        context.contentResolver.openInputStream(file.uri)!!.use { input ->
-                            local.outputStream().use { input.copyTo(it) }
-                        }
+                        val source = prepare(file, scratch)
                         item.status = "Sending"
                         val started = System.nanoTime()
-                        val bytes = FluxCore.sendFile(addr, local.path)
+                        val bytes = FluxCore.sendFd(addr, source.name, source.size, source.pfd.detachFd())
                         val seconds = (System.nanoTime() - started) / 1e9
                         speed = "%.1f MB/s".format(bytes / seconds / 1e6)
                         item.status = "Done"
@@ -119,7 +131,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                             error = e.message
                         }
                     } finally {
-                        local.delete()
+                        scratch.forEach { it.delete() }
                     }
                 }
             } finally {
@@ -130,6 +142,65 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                 if (transfers.isNotEmpty() && transfers.all { it.status == "Done" }) progress = 1f
             }
         }
+    }
+
+    private fun prepare(file: Picked, scratch: MutableList<File>): Source {
+        file.app?.let { app ->
+            val apk = if (app.apks.size == 1) app.apks[0] else bundle(app).also { scratch.add(it) }
+            return Source(ParcelFileDescriptor.open(apk, ParcelFileDescriptor.MODE_READ_ONLY), file.name, apk.length())
+        }
+        val uri = file.uri!!
+        val direct = context.contentResolver.openFileDescriptor(uri, "r")
+        if (direct != null && direct.statSize >= 0) {
+            return Source(direct, file.name, direct.statSize)
+        }
+        direct?.close()
+        val local = File(context.cacheDir, file.name).also { scratch.add(it) }
+        context.contentResolver.openInputStream(uri)!!.use { input ->
+            local.outputStream().use { input.copyTo(it) }
+        }
+        return Source(ParcelFileDescriptor.open(local, ParcelFileDescriptor.MODE_READ_ONLY), file.name, local.length())
+    }
+
+    private fun bundle(app: AppEntry): File {
+        val out = File(context.cacheDir, app.fileName)
+        ZipOutputStream(out.outputStream().buffered()).use { zip ->
+            zip.setLevel(Deflater.NO_COMPRESSION)
+            app.apks.forEach { apk ->
+                zip.putNextEntry(ZipEntry(apk.name))
+                apk.inputStream().use { it.copyTo(zip) }
+                zip.closeEntry()
+            }
+        }
+        return out
+    }
+
+    suspend fun loadApps() {
+        val found = withContext(Dispatchers.IO) {
+            val pm = context.packageManager
+            val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            pm.queryIntentActivities(launcher, 0)
+                .map { it.activityInfo.applicationInfo }
+                .distinctBy { it.packageName }
+                .filter {
+                    (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
+                        (it.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                }
+                .map { info ->
+                    val parts = listOf(info.sourceDir) + (info.splitSourceDirs?.toList() ?: emptyList())
+                    AppEntry(info.loadLabel(pm).toString(), info.packageName, parts.map { File(it) })
+                }
+                .sortedBy { it.label.lowercase() }
+        }
+        apps.clear()
+        apps.addAll(found)
+    }
+
+    fun isSelected(app: AppEntry) = picked.any { it.app?.packageName == app.packageName }
+
+    fun toggleApp(app: AppEntry) {
+        val index = picked.indexOfFirst { it.app?.packageName == app.packageName }
+        if (index >= 0) picked.removeAt(index) else picked.add(Picked(app.fileName, app = app))
     }
 
     private suspend fun trackSend(count: Int) {

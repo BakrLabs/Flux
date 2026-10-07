@@ -1,3 +1,4 @@
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -98,6 +99,32 @@ pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_sendFile(
         return 0;
     };
     match runtime().block_on(flux_core::send_file_with(addr, Path::new(&path), &SEND)) {
+        Ok(bytes) => bytes as jlong,
+        Err(e) => {
+            fail(&mut env, format!("{e:#}"));
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_sendFd(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    name: JString,
+    size: jlong,
+    fd: jint,
+) -> jlong {
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let Some(addr) = read_string(&mut env, &addr) else {
+        return 0;
+    };
+    let Some(name) = read_string(&mut env, &name) else {
+        return 0;
+    };
+    let reader = tokio::fs::File::from_std(file);
+    match runtime().block_on(flux_core::send_stream_with(addr, &name, size as u64, reader, &SEND)) {
         Ok(bytes) => bytes as jlong,
         Err(e) => {
             fail(&mut env, format!("{e:#}"));

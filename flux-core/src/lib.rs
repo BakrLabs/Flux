@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::time::{sleep, timeout};
 
@@ -116,9 +116,20 @@ pub async fn send_file_with<A: ToSocketAddrs>(addr: A, path: &Path, ctl: &Contro
         bail!("file name too long");
     }
 
-    let mut file = File::open(path).await?;
+    let file = File::open(path).await?;
     let size = file.metadata().await?.len();
-    ctl.begin(&name, size);
+    send_stream_with(addr, &name, size, file, ctl).await
+}
+
+pub async fn send_stream_with<A, R>(addr: A, name: &str, size: u64, mut reader: R, ctl: &Control) -> Result<u64>
+where
+    A: ToSocketAddrs,
+    R: AsyncRead + Unpin,
+{
+    if name.is_empty() || name.len() > MAX_NAME {
+        bail!("bad file name");
+    }
+    ctl.begin(name, size);
     ctl.check()?;
 
     let mut stream = TcpStream::connect(addr).await?;
@@ -131,7 +142,7 @@ pub async fn send_file_with<A: ToSocketAddrs>(addr: A, path: &Path, ctl: &Contro
     let mut buf = vec![0u8; CHUNK];
     loop {
         ctl.checkpoint().await?;
-        let n = file.read(&mut buf).await?;
+        let n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }

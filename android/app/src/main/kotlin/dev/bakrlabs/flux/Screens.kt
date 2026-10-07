@@ -1,6 +1,7 @@
 package dev.bakrlabs.flux
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,6 +29,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,11 +37,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.graphics.drawable.toBitmap
 
 @Composable
 private fun Page(content: @Composable ColumnScope.() -> Unit) {
@@ -124,12 +129,13 @@ private fun BigCard(title: String, glyph: String, filled: Boolean, modifier: Mod
 }
 
 @Composable
-private fun Tab(label: String, selected: Boolean, modifier: Modifier) {
+private fun Tab(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit = {}) {
     Box(
         modifier
             .height(44.dp)
             .clip(RoundedCornerShape(18.dp))
-            .background(if (selected) Palette.border else Color.Transparent),
+            .background(if (selected) Palette.border else Color.Transparent)
+            .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { Text(label, color = if (selected) Palette.text else Palette.muted, fontSize = 14.sp) }
 }
@@ -180,6 +186,44 @@ private fun DeviceRow(name: String, host: String, selected: Boolean, onClick: ()
         Spacer(Modifier.width(12.dp))
         Text(name, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
         Text(host, color = Palette.muted, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
+    }
+}
+
+@Composable
+private fun AppRow(app: AppEntry, selected: Boolean, onClick: () -> Unit) {
+    val context = LocalContext.current
+    val icon = remember(app.packageName) {
+        runCatching { context.packageManager.getApplicationIcon(app.packageName).toBitmap(96, 96).asImageBitmap() }.getOrNull()
+    }
+    val shape = RoundedCornerShape(16.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(60.dp)
+            .clip(shape)
+            .background(Palette.card)
+            .border(1.dp, if (selected) Palette.accent else Palette.border, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (icon != null) {
+            Image(icon, contentDescription = null, modifier = Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)))
+        } else {
+            Box(Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(Palette.border))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(app.label, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (app.apks.size > 1) {
+                Text("${app.apks.size} parts, sent as .apks", color = Palette.muted, fontSize = 12.sp)
+            }
+        }
+        if (selected) {
+            Box(Modifier.size(24.dp).clip(CircleShape).background(Palette.accent), contentAlignment = Alignment.Center) {
+                Text("✓", color = Palette.onAccent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
+        }
     }
 }
 
@@ -345,6 +389,7 @@ fun HomeScreen(state: FluxState) {
 @Composable
 fun SendScreen(state: FluxState, pick: () -> Unit) {
     LaunchedEffect(Unit) { state.discover() }
+    LaunchedEffect(state.tab) { if (state.tab == 1 && state.apps.isEmpty()) state.loadApps() }
     val chosen = state.devices.firstOrNull { "${it.host}:${it.port}" == state.target }
     Page {
         TopBar("Send") { state.screen = Screen.Home }
@@ -356,8 +401,8 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
                 .padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Tab("Files", true, Modifier.weight(1f))
-            Tab("Apps", false, Modifier.weight(1f))
+            Tab("Files", state.tab == 0, Modifier.weight(1f)) { state.tab = 0 }
+            Tab("Apps", state.tab == 1, Modifier.weight(1f)) { state.tab = 1 }
         }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionHeader("Send to")
@@ -370,12 +415,22 @@ fun SendScreen(state: FluxState, pick: () -> Unit) {
             }
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            SectionHeader("Files (${state.picked.size})", "+ Add", pick)
-            if (state.picked.isEmpty()) {
-                Text("Nothing selected yet.", color = Palette.muted, fontSize = 14.sp)
-            }
-            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.picked) { file -> FileRow(file.name) { state.picked.remove(file) } }
+            if (state.tab == 0) {
+                SectionHeader("Files (${state.picked.size})", "+ Add", pick)
+                if (state.picked.isEmpty()) {
+                    Text("Nothing selected yet.", color = Palette.muted, fontSize = 14.sp)
+                }
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(state.picked) { file -> FileRow(file.name) { state.picked.remove(file) } }
+                }
+            } else {
+                SectionHeader("Installed apps (${state.picked.count { it.app != null }} selected)")
+                if (state.apps.isEmpty()) {
+                    Text("Loading apps...", color = Palette.muted, fontSize = 14.sp)
+                }
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(state.apps) { app -> AppRow(app, state.isSelected(app)) { state.toggleApp(app) } }
+                }
             }
         }
         TextField(
