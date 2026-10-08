@@ -29,11 +29,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.io.IOException
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import org.json.JSONObject
 
 enum class Screen { Home, Send, Receive, Progress }
 
@@ -47,6 +50,10 @@ class Picked(val name: String, val uri: Uri? = null, val app: AppEntry? = null)
 private class Source(val pfd: ParcelFileDescriptor, val name: String, val size: Long)
 
 class Received(val name: String, val uri: Uri, val mime: String)
+
+class UpdateInfo(val build: Int, val title: String, val url: String, val size: Long)
+
+private const val REPO = "BakrLabs/flux"
 
 class Item(val name: String) {
     var status by mutableStateOf("Queued")
@@ -71,6 +78,13 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val received = mutableStateListOf<Received>()
     val apps = mutableStateListOf<AppEntry>()
     var tab by mutableStateOf(0)
+    var update by mutableStateOf<UpdateInfo?>(null)
+    var updating by mutableStateOf(false)
+    var updateProgress by mutableStateOf(0f)
+    var updateStatus by mutableStateOf("")
+    val installedBuild: Int = runCatching {
+        context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode.toInt()
+    }.getOrDefault(0)
     private var receiving: Job? = null
 
     @Volatile
@@ -300,14 +314,120 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         return Received(source.name, uri, mime)
     }
 
-    private fun installBundle(item: Received) {
-        if (!context.packageManager.canRequestPackageInstalls()) {
-            val settings = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(settings)
-            error = "Allow installs from Flux, then tap Install again"
+    private fun allowedToInstall(): Boolean {
+        if (context.packageManager.canRequestPackageInstalls()) return true
+        val settings = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(settings)
+        error = "Allow installs from Flux, then try again"
+        updateStatus = "Allow installs from Flux, then tap Update again"
+        return false
+    }
+
+    fun checkNow() {
+        scope.launch { checkForUpdate(true) }
+    }
+
+    suspend fun checkForUpdate(manual: Boolean = false) {
+        if (manual) updateStatus = "Checking..."
+        val release = withContext(Dispatchers.IO) {
+            runCatching {
+                val connection = URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection
+                connection.setRequestProperty("Accept", "application/vnd.github+json")
+                connection.setRequestProperty("User-Agent", "Flux-Updater")
+                connection.connectTimeout = 8000
+                connection.readTimeout = 8000
+                connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+            }.getOrNull()
+        }
+        if (release == null) {
+            if (manual) updateStatus = "Could not reach GitHub"
             return
         }
+        val build = release.optString("tag_name").removePrefix("build-").toIntOrNull()
+        val assets = release.optJSONArray("assets")
+        val asset = assets?.let { list ->
+            (0 until list.length()).map { list.getJSONObject(it) }.firstOrNull { it.optString("name").endsWith(".apk") }
+        }
+        if (build == null || asset == null) {
+            if (manual) updateStatus = "No update found"
+            return
+        }
+        if (build > installedBuild) {
+            update = UpdateInfo(build, release.optString("name"), asset.getString("browser_download_url"), asset.optLong("size"))
+            updateStatus = ""
+        } else if (manual) {
+            updateStatus = "Flux is up to date"
+        }
+    }
+
+    fun installUpdate() {
+        val info = update ?: return
+        if (!allowedToInstall()) return
+        updating = true
+        updateProgress = 0f
+        updateStatus = ""
+        scope.launch(Dispatchers.IO) {
+            val apk = File(context.cacheDir, "flux-update.apk")
+            try {
+                val connection = URL(info.url).openConnection() as HttpURLConnection
+                connection.connectTimeout = 10000
+                connection.readTimeout = 15000
+                val total = connection.contentLengthLong.takeIf { it > 0 } ?: info.size
+                connection.inputStream.use { input ->
+                    apk.outputStream().use { out ->
+                        val buffer = ByteArray(64 * 1024)
+                        var done = 0L
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n < 0) break
+                            out.write(buffer, 0, n)
+                            done += n
+                            if (total > 0) updateProgress = done.toFloat() / total
+                        }
+                    }
+                }
+                commitApk(apk)
+                update = null
+            } catch (e: Exception) {
+                updateStatus = "Update failed: ${e.message}"
+            } finally {
+                updating = false
+            }
+        }
+    }
+
+    private fun commitApk(apk: File) {
+        val installer = context.packageManager.packageInstaller
+        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+        if (Build.VERSION.SDK_INT >= 31) {
+            params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+        }
+        val id = installer.createSession(params)
+        try {
+            installer.openSession(id).use { session ->
+                apk.inputStream().use { input ->
+                    session.openWrite("flux.apk", 0, apk.length()).use { out ->
+                        input.copyTo(out)
+                        session.fsync(out)
+                    }
+                }
+                val callback = PendingIntent.getBroadcast(
+                    context,
+                    id,
+                    Intent(context, InstallReceiver::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+                session.commit(callback.intentSender)
+            }
+        } catch (e: Exception) {
+            runCatching { installer.abandonSession(id) }
+            throw e
+        }
+    }
+
+    private fun installBundle(item: Received) {
+        if (!allowedToInstall()) return
         val installer = context.packageManager.packageInstaller
         val id = installer.createSession(PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL))
         try {

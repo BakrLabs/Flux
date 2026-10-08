@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
@@ -29,6 +30,8 @@ class MainActivity : ComponentActivity() {
                     ActivityResultContracts.OpenMultipleDocuments()
                 ) { uris -> state.addPicked(uris) }
 
+                LaunchedEffect(Unit) { state.checkForUpdate() }
+
                 BackHandler(enabled = state.screen != Screen.Home) {
                     if (state.screen == Screen.Receive) state.stopReceiving() else state.screen = Screen.Home
                 }
@@ -39,6 +42,8 @@ class MainActivity : ComponentActivity() {
                     Screen.Receive -> ReceiveScreen(state)
                     Screen.Progress -> ProgressScreen(state)
                 }
+
+                state.update?.let { UpdateDialog(state, it) }
             }
         }
     }

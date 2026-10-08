@@ -24,7 +24,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
@@ -45,6 +47,37 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+
+@Composable
+fun UpdateDialog(state: FluxState, info: UpdateInfo) {
+    AlertDialog(
+        onDismissRequest = { if (!state.updating) state.update = null },
+        containerColor = Palette.card,
+        title = { Text("Update available", color = Palette.text, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Build ${info.build} is ready. You have build ${state.installedBuild}.", color = Palette.muted, fontSize = 14.sp)
+                if (state.updating) {
+                    ProgressBar(state.updateProgress)
+                    Text("Downloading...", color = Palette.muted, fontSize = 13.sp)
+                }
+                if (state.updateStatus.isNotEmpty()) {
+                    Text(state.updateStatus, color = Palette.danger, fontSize = 13.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { state.installUpdate() }, enabled = !state.updating) {
+                Text("Update", color = Palette.accent, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { state.update = null }, enabled = !state.updating) {
+                Text("Later", color = Palette.muted)
+            }
+        },
+    )
+}
 
 @Composable
 private fun Page(content: @Composable ColumnScope.() -> Unit) {
@@ -335,7 +368,7 @@ fun HomeScreen(state: FluxState) {
     Page {
         Column {
             Text("Flux", color = Palette.accent, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-            Text("by BakrLabs", color = Palette.muted, fontSize = 12.sp)
+            Text("by BakrLabs  ·  build ${state.installedBuild}", color = Palette.muted, fontSize = 12.sp)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             BigCard("Send", "↗", true, Modifier.weight(1f)) { state.screen = Screen.Send }
@@ -389,6 +422,16 @@ fun HomeScreen(state: FluxState) {
             Text("Recent", color = Palette.muted, fontSize = 13.sp)
             state.recent.take(3).forEach { Text(it, color = Palette.text, fontSize = 15.sp) }
         }
+        Spacer(Modifier.weight(1f))
+        Text(
+            state.updateStatus.ifEmpty { "Check for updates" },
+            color = Palette.muted,
+            fontSize = 13.sp,
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .clickable { state.checkNow() }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        )
     }
 }
 

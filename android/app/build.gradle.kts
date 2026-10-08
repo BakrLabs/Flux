@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val buildNumber = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
+
 android {
     namespace = "dev.bakrlabs.flux"
     compileSdk = 35
@@ -21,8 +23,8 @@ android {
         applicationId = "dev.bakrlabs.flux"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = buildNumber
+        versionName = "0.1.$buildNumber"
         ndk {
             abiFilters += "arm64-v8a"
         }
