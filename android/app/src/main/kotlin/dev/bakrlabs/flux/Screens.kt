@@ -271,7 +271,13 @@ private fun ReceivedRow(name: String, onOpen: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(name, color = Palette.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-        Text("Open", color = Palette.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
+        Text(
+            if (name.endsWith(".apk", ignoreCase = true) || name.endsWith(".apks", ignoreCase = true)) "Install" else "Open",
+            color = Palette.accent,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(start = 12.dp),
+        )
     }
 }
 

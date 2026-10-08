@@ -1,10 +1,12 @@
 package dev.bakrlabs.flux
 
+import android.app.PendingIntent
 import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInstaller
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -12,6 +14,7 @@ import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.webkit.MimeTypeMap
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -29,6 +32,7 @@ import java.io.File
 import java.io.IOException
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 enum class Screen { Home, Send, Receive, Progress }
@@ -296,7 +300,50 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         return Received(source.name, uri, mime)
     }
 
+    private fun installBundle(item: Received) {
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            val settings = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(settings)
+            error = "Allow installs from Flux, then tap Install again"
+            return
+        }
+        val installer = context.packageManager.packageInstaller
+        val id = installer.createSession(PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL))
+        try {
+            installer.openSession(id).use { session ->
+                var parts = 0
+                ZipInputStream(context.contentResolver.openInputStream(item.uri)!!.buffered()).use { zip ->
+                    while (true) {
+                        val entry = zip.nextEntry ?: break
+                        if (!entry.name.endsWith(".apk", ignoreCase = true)) continue
+                        session.openWrite(entry.name.substringAfterLast('/'), 0, -1).use { out ->
+                            zip.copyTo(out)
+                            session.fsync(out)
+                        }
+                        parts++
+                    }
+                }
+                if (parts == 0) throw IOException("no APK files inside ${item.name}")
+                val callback = PendingIntent.getBroadcast(
+                    context,
+                    id,
+                    Intent(context, InstallReceiver::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+                session.commit(callback.intentSender)
+            }
+        } catch (e: Exception) {
+            runCatching { installer.abandonSession(id) }
+            error = e.message
+        }
+    }
+
     fun open(item: Received) {
+        if (item.name.endsWith(".apks", ignoreCase = true)) {
+            scope.launch(Dispatchers.IO) { installBundle(item) }
+            return
+        }
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(item.uri, item.mime)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
