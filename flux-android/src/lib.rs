@@ -3,7 +3,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use flux_core::Control;
+use flux_core::{Control, Incoming};
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static LISTENER: Mutex<Option<Arc<TcpListener>>> = Mutex::new(None);
+static PENDING: Mutex<Option<Incoming>> = Mutex::new(None);
 static SEND: Control = Control::new();
 static RECEIVE: Control = Control::new();
 
@@ -82,6 +83,60 @@ pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_receiveOne(
             fail(&mut env, format!("{e:#}"));
             ptr::null_mut()
         }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_receiveHeader(mut env: JNIEnv, _class: JClass) -> jstring {
+    let listener = LISTENER.lock().unwrap().clone();
+    let Some(listener) = listener else {
+        fail(&mut env, "receiver is not bound");
+        return ptr::null_mut();
+    };
+    match runtime().block_on(flux_core::accept_incoming(&listener, &RECEIVE)) {
+        Ok(incoming) => {
+            let info = format!("{}\t{}", incoming.name, incoming.size);
+            *PENDING.lock().unwrap() = Some(incoming);
+            to_jstring(&mut env, info)
+        }
+        Err(e) => {
+            fail(&mut env, format!("{e:#}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_receiveBody(mut env: JNIEnv, _class: JClass, fd: jint) -> jlong {
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let pending = PENDING.lock().unwrap().take();
+    let Some(incoming) = pending else {
+        fail(&mut env, "no incoming transfer");
+        return 0;
+    };
+    let size = incoming.size;
+    let mut file = tokio::fs::File::from_std(file);
+    let result = runtime().block_on(async {
+        incoming
+            .save_to(&mut file, &RECEIVE)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        file.sync_all().await.map_err(|e| e.to_string())
+    });
+    match result {
+        Ok(()) => size as jlong,
+        Err(msg) => {
+            fail(&mut env, msg);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bakrlabs_flux_FluxCore_receiveReject(_env: JNIEnv, _class: JClass, code: jint) {
+    let pending = PENDING.lock().unwrap().take();
+    if let Some(incoming) = pending {
+        runtime().block_on(incoming.reject(code as u8));
     }
 }
 

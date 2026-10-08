@@ -2,17 +2,27 @@ use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::time::{sleep, timeout};
 
 const CHUNK: usize = 256 * 1024;
 const MAX_NAME: usize = 1024;
 const POLL: Duration = Duration::from_millis(300);
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const PROTOCOL: u8 = 2;
+
+pub const READY: u8 = 10;
+pub const ACK_OK: u8 = 1;
+pub const ACK_CORRUPT: u8 = 2;
+pub const ACK_FAILED: u8 = 3;
+pub const ACK_NO_SPACE: u8 = 4;
 
 pub struct Control {
     done: AtomicU64,
@@ -98,6 +108,31 @@ pub fn local_ip() -> Option<IpAddr> {
     Some(sock.local_addr().ok()?.ip())
 }
 
+fn explain(code: u8) -> anyhow::Error {
+    match code {
+        ACK_CORRUPT => anyhow!("the file arrived damaged (checksum mismatch)"),
+        ACK_NO_SPACE => anyhow!("the receiver does not have enough free space"),
+        _ => anyhow!("the receiver could not save the file"),
+    }
+}
+
+async fn read_reply(stream: &mut TcpStream, ctl: &Control, limit: Duration, closed: &str) -> Result<u8> {
+    let started = Instant::now();
+    let mut byte = [0u8; 1];
+    loop {
+        ctl.check()?;
+        if started.elapsed() > limit {
+            bail!("the receiver did not answer in time");
+        }
+        match timeout(POLL, stream.read(&mut byte)).await {
+            Err(_) => continue,
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(0)) => bail!("{closed}"),
+            Ok(Ok(_)) => return Ok(byte[0]),
+        }
+    }
+}
+
 pub async fn send_file<A: ToSocketAddrs>(addr: A, path: &Path) -> Result<u64> {
     send_file_with(addr, path, &Control::new()).await
 }
@@ -112,10 +147,6 @@ pub async fn send_file_with<A: ToSocketAddrs>(addr: A, path: &Path, ctl: &Contro
         .context("path has no file name")?
         .to_string_lossy()
         .into_owned();
-    if name.len() > MAX_NAME {
-        bail!("file name too long");
-    }
-
     let file = File::open(path).await?;
     let size = file.metadata().await?.len();
     send_stream_with(addr, &name, size, file, ctl).await
@@ -134,9 +165,18 @@ where
 
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
+    stream.write_all(b"FX").await?;
+    stream.write_u8(PROTOCOL).await?;
     stream.write_u16(name.len() as u16).await?;
     stream.write_all(name.as_bytes()).await?;
     stream.write_u64(size).await?;
+    stream.flush().await?;
+
+    let closed = "the receiver closed the connection (it may be running an older Flux)";
+    let reply = read_reply(&mut stream, ctl, READY_TIMEOUT, closed).await?;
+    if reply != READY {
+        return Err(explain(reply));
+    }
 
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; CHUNK];
@@ -152,33 +192,93 @@ where
     }
     stream.write_all(hasher.finalize().as_bytes()).await?;
     stream.flush().await?;
+
+    let closed = "the receiver closed the connection before confirming";
+    let reply = read_reply(&mut stream, ctl, ACK_TIMEOUT, closed).await?;
+    if reply != ACK_OK {
+        return Err(explain(reply));
+    }
     Ok(size)
 }
 
-pub async fn receive_one_with(listener: &TcpListener, out_dir: &Path, ctl: &Control) -> Result<PathBuf> {
+pub struct Incoming {
+    stream: TcpStream,
+    pub name: String,
+    pub size: u64,
+}
+
+async fn read_header(stream: &mut TcpStream) -> Result<(String, u64)> {
+    let mut magic = [0u8; 3];
+    stream.read_exact(&mut magic).await?;
+    if &magic[..2] != b"FX" {
+        bail!("the sender is running an older version of Flux");
+    }
+    if magic[2] != PROTOCOL {
+        bail!("the sender uses a different Flux protocol (version {})", magic[2]);
+    }
+    let name_len = stream.read_u16().await? as usize;
+    if name_len == 0 || name_len > MAX_NAME {
+        bail!("bad file name length");
+    }
+    let mut buf = vec![0u8; name_len];
+    stream.read_exact(&mut buf).await?;
+    let raw = String::from_utf8(buf)?;
+    let name = Path::new(&raw)
+        .file_name()
+        .context("bad file name")?
+        .to_string_lossy()
+        .into_owned();
+    let size = stream.read_u64().await?;
+    Ok((name, size))
+}
+
+pub async fn accept_incoming(listener: &TcpListener, ctl: &Control) -> Result<Incoming> {
     let mut stream = loop {
         ctl.check()?;
         if let Ok(accepted) = timeout(POLL, listener.accept()).await {
             break accepted?.0;
         }
     };
+    let (name, size) = timeout(HEADER_TIMEOUT, read_header(&mut stream))
+        .await
+        .map_err(|_| anyhow!("the sender stalled while introducing the file"))??;
+    ctl.begin(&name, size);
+    Ok(Incoming { stream, name, size })
+}
 
-    let name_len = stream.read_u16().await? as usize;
-    if name_len == 0 || name_len > MAX_NAME {
-        bail!("bad file name length");
+impl Incoming {
+    pub async fn save_to<W: AsyncWrite + Unpin>(mut self, writer: &mut W, ctl: &Control) -> Result<()> {
+        self.stream.write_all(&[READY]).await?;
+        self.stream.flush().await?;
+
+        let outcome = receive_body(&mut self.stream, writer, self.size, ctl).await;
+        let code = match &outcome {
+            Ok(true) => ACK_OK,
+            Ok(false) => ACK_CORRUPT,
+            Err(_) => ACK_FAILED,
+        };
+        let _ = self.stream.write_all(&[code]).await;
+        let _ = self.stream.flush().await;
+
+        match outcome {
+            Ok(true) => Ok(()),
+            Ok(false) => bail!("checksum mismatch"),
+            Err(e) => Err(e),
+        }
     }
-    let mut name_buf = vec![0u8; name_len];
-    stream.read_exact(&mut name_buf).await?;
-    let raw_name = String::from_utf8(name_buf)?;
-    let name = Path::new(&raw_name)
-        .file_name()
-        .context("bad file name")?
-        .to_owned();
-    let size = stream.read_u64().await?;
-    ctl.begin(&name.to_string_lossy(), size);
 
-    let dest = out_dir.join(&name);
-    let outcome = receive_body(&mut stream, &dest, size, ctl).await;
+    pub async fn reject(mut self, code: u8) {
+        let _ = self.stream.write_all(&[code]).await;
+        let _ = self.stream.flush().await;
+    }
+}
+
+pub async fn receive_one_with(listener: &TcpListener, out_dir: &Path, ctl: &Control) -> Result<PathBuf> {
+    let incoming = accept_incoming(listener, ctl).await?;
+    let dest = out_dir.join(&incoming.name);
+    let mut file = File::create(&dest).await?;
+    let outcome = incoming.save_to(&mut file, ctl).await;
+    drop(file);
     if outcome.is_err() {
         tokio::fs::remove_file(&dest).await.ok();
     }
@@ -186,8 +286,12 @@ pub async fn receive_one_with(listener: &TcpListener, out_dir: &Path, ctl: &Cont
     Ok(dest)
 }
 
-async fn receive_body(stream: &mut TcpStream, dest: &Path, size: u64, ctl: &Control) -> Result<()> {
-    let mut file = File::create(dest).await?;
+async fn receive_body<W: AsyncWrite + Unpin>(
+    stream: &mut TcpStream,
+    writer: &mut W,
+    size: u64,
+    ctl: &Control,
+) -> Result<bool> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; CHUNK];
     let mut remaining = size;
@@ -203,17 +307,26 @@ async fn receive_body(stream: &mut TcpStream, dest: &Path, size: u64, ctl: &Cont
             bail!("connection closed early");
         }
         hasher.update(&buf[..n]);
-        file.write_all(&buf[..n]).await?;
+        writer.write_all(&buf[..n]).await?;
         remaining -= n as u64;
         ctl.advance(n as u64);
     }
 
     let mut expected = [0u8; 32];
-    stream.read_exact(&mut expected).await?;
-    file.flush().await?;
-
-    if hasher.finalize() != expected {
-        bail!("checksum mismatch");
+    let mut got = 0;
+    while got < expected.len() {
+        ctl.check()?;
+        match timeout(POLL, stream.read(&mut expected[got..])).await {
+            Err(_) => continue,
+            Ok(read) => {
+                let n = read?;
+                if n == 0 {
+                    bail!("connection closed early");
+                }
+                got += n;
+            }
+        }
     }
-    Ok(())
+    writer.flush().await?;
+    Ok(hasher.finalize() == expected)
 }

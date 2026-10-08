@@ -8,6 +8,9 @@ object FluxCore {
     external fun localIp(): String
     external fun bindReceiver(): Int
     external fun receiveOne(outDir: String): String
+    external fun receiveHeader(): String
+    external fun receiveBody(fd: Int): Long
+    external fun receiveReject(code: Int)
     external fun sendFile(addr: String, path: String): Long
     external fun sendFd(addr: String, name: String, size: Long, fd: Int): Long
     external fun progressDone(channel: Int): Long

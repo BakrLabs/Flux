@@ -46,6 +46,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.core.graphics.drawable.toBitmap
 
 @Composable
@@ -419,7 +422,7 @@ fun HomeScreen(state: FluxState) {
             }
         }
         if (state.recent.isNotEmpty()) {
-            Text("Recent", color = Palette.muted, fontSize = 13.sp)
+            SectionHeader("Recent", "See all") { state.screen = Screen.History }
             state.recent.take(3).forEach { Text(it, color = Palette.text, fontSize = 15.sp) }
         }
         Spacer(Modifier.weight(1f))
@@ -630,6 +633,34 @@ fun ProgressScreen(state: FluxState) {
             }
         } else {
             PillButton("Done", { state.screen = Screen.Home }, Modifier.fillMaxWidth(), filled = false)
+        }
+    }
+}
+
+@Composable
+fun HistoryScreen(state: FluxState) {
+    val format = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
+    Page {
+        TopBar("History") { state.screen = Screen.Home }
+        SectionHeader("${state.history.size} items", if (state.history.isEmpty()) null else "Clear") { state.clearHistory() }
+        if (state.history.isEmpty()) {
+            Text("Nothing here yet.", color = Palette.muted, fontSize = 14.sp)
+        }
+        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(state.history) { entry ->
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Palette.card)
+                        .then(if (entry.uri != null) Modifier.clickable { state.openEntry(entry) } else Modifier)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(entry.text, color = if (entry.ok) Palette.text else Palette.danger, fontSize = 15.sp)
+                    Text(format.format(Date(entry.time)), color = Palette.muted, fontSize = 12.sp)
+                }
+            }
         }
     }
 }

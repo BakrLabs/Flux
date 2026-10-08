@@ -12,6 +12,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.StatFs
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
@@ -36,9 +37,10 @@ import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import org.json.JSONArray
 import org.json.JSONObject
 
-enum class Screen { Home, Send, Receive, Progress }
+enum class Screen { Home, Send, Receive, Progress, History }
 
 class AppEntry(val label: String, val packageName: String, val apks: List<File>) {
     val fileName: String
@@ -50,6 +52,15 @@ class Picked(val name: String, val uri: Uri? = null, val app: AppEntry? = null)
 private class Source(val pfd: ParcelFileDescriptor, val name: String, val size: Long)
 
 class Received(val name: String, val uri: Uri, val mime: String)
+
+class HistoryEntry(
+    val time: Long,
+    val text: String,
+    val ok: Boolean,
+    val name: String? = null,
+    val uri: String? = null,
+    val mime: String? = null,
+)
 
 class UpdateInfo(val build: Int, val title: String, val url: String, val size: Long)
 
@@ -73,7 +84,8 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     var error by mutableStateOf<String?>(null)
     val picked = mutableStateListOf<Picked>()
     val transfers = mutableStateListOf<Item>()
-    val recent = mutableStateListOf<String>()
+    val history = mutableStateListOf<HistoryEntry>()
+    val recent: List<String> get() = history.take(3).map { it.text }
     val devices = mutableStateListOf<Device>()
     val received = mutableStateListOf<Received>()
     val apps = mutableStateListOf<AppEntry>()
@@ -86,6 +98,74 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode.toInt()
     }.getOrDefault(0)
     private var receiving: Job? = null
+    private val prefs = context.getSharedPreferences("flux", Context.MODE_PRIVATE)
+
+    @Volatile
+    private var receivingActive = false
+
+    @Volatile
+    private var sessionId = 0
+
+    init {
+        history.addAll(loadHistory())
+    }
+
+    private fun loadHistory(): List<HistoryEntry> = runCatching {
+        val array = JSONArray(prefs.getString("history", "[]"))
+        (0 until array.length()).map {
+            val o = array.getJSONObject(it)
+            HistoryEntry(
+                o.getLong("time"),
+                o.getString("text"),
+                o.getBoolean("ok"),
+                o.optString("name").ifEmpty { null },
+                o.optString("uri").ifEmpty { null },
+                o.optString("mime").ifEmpty { null },
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    private fun saveHistory() {
+        val array = JSONArray()
+        history.forEach {
+            array.put(
+                JSONObject()
+                    .put("time", it.time)
+                    .put("text", it.text)
+                    .put("ok", it.ok)
+                    .put("name", it.name ?: "")
+                    .put("uri", it.uri ?: "")
+                    .put("mime", it.mime ?: ""),
+            )
+        }
+        prefs.edit().putString("history", array.toString()).apply()
+    }
+
+    @Synchronized
+    private fun log(text: String, ok: Boolean = true, item: Received? = null) {
+        history.add(0, HistoryEntry(System.currentTimeMillis(), text, ok, item?.name, item?.uri?.toString(), item?.mime))
+        while (history.size > 100) history.removeAt(history.size - 1)
+        saveHistory()
+    }
+
+    @Synchronized
+    fun clearHistory() {
+        history.clear()
+        saveHistory()
+    }
+
+    fun openEntry(entry: HistoryEntry) {
+        val uri = entry.uri ?: return
+        open(Received(entry.name ?: "file", Uri.parse(uri), entry.mime ?: "application/octet-stream"))
+    }
+
+    private fun refreshService() {
+        if (sending || receivingActive) {
+            TransferService.start(context, if (sending) "Sending files" else "Ready to receive")
+        } else {
+            TransferService.stop(context)
+        }
+    }
 
     @Volatile
     private var cancelRequested = false
@@ -120,6 +200,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         currentFile = 0
         FluxCore.reset(0)
         screen = Screen.Progress
+        refreshService()
         scope.launch(Dispatchers.IO) {
             val ticker = launch { trackSend(files.size) }
             try {
@@ -140,13 +221,14 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                         val seconds = (System.nanoTime() - started) / 1e9
                         speed = "%.1f MB/s".format(bytes / seconds / 1e6)
                         item.status = "Done"
-                        recent.add(0, "Sent ${file.name}")
+                        log("Sent ${file.name}")
                     } catch (e: Exception) {
                         if (cancelRequested) {
                             item.status = "Cancelled"
                         } else {
                             item.status = "Failed"
                             error = e.message
+                            log("Could not send ${file.name}: ${e.message}", ok = false)
                         }
                     } finally {
                         scratch.forEach { it.delete() }
@@ -157,7 +239,10 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                 sending = false
                 paused = false
                 eta = ""
-                if (transfers.isNotEmpty() && transfers.all { it.status == "Done" }) progress = 1f
+                val allDone = transfers.isNotEmpty() && transfers.all { it.status == "Done" }
+                if (allDone) progress = 1f
+                Notifications.done(context, if (allDone) "Sent ${transfers.size} item(s)" else "Transfer did not finish")
+                refreshService()
             }
         }
     }
@@ -224,6 +309,7 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     private suspend fun trackSend(count: Int) {
         var lastDone = 0L
         var lastTime = System.nanoTime()
+        var lastNotify = 0L
         var smooth = 0.0
         while (true) {
             delay(200)
@@ -245,6 +331,12 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                 smooth = if (smooth == 0.0) instant else smooth * 0.7 + instant * 0.3
                 speed = "%.1f MB/s".format(smooth / 1e6)
                 eta = clock(((total - done) / smooth).toLong())
+            }
+            val wall = System.currentTimeMillis()
+            if (wall - lastNotify > 1000) {
+                lastNotify = wall
+                val extra = if (speed.isNotEmpty()) " · $speed" else ""
+                Notifications.update(context, "Sending ${currentFile + 1} of $count$extra", (progress * 100).toInt())
             }
         }
     }
@@ -292,26 +384,57 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         if (index >= 0) devices[index] = found else devices.add(found)
     }
 
-    private fun publish(source: File): Received {
-        val extension = source.extension.lowercase()
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
+    private fun displayNameOf(uri: Uri): String? =
+        context.contentResolver
+            .query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
+            ?.use { if (it.moveToFirst()) it.getString(0) else null }
+
+    private fun receiveOne() {
+        val header = FluxCore.receiveHeader()
+        val name = header.substringBeforeLast('\t')
+        val size = header.substringAfterLast('\t').toLongOrNull() ?: 0L
+        val free = StatFs((context.getExternalFilesDir(null) ?: context.filesDir).path).availableBytes
+        if (size + 50L * 1024 * 1024 > free) {
+            FluxCore.receiveReject(4)
+            throw IOException("Not enough free space for $name (needs ${size / 1_000_000} MB, ${free / 1_000_000} MB free)")
+        }
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(File(name).extension.lowercase())
+            ?: "application/octet-stream"
         val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, source.name)
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
             put(MediaStore.Downloads.MIME_TYPE, mime)
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Flux")
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IOException("could not create the file in Downloads")
-        resolver.openOutputStream(uri)!!.use { out ->
-            source.inputStream().use { it.copyTo(out) }
+        if (uri == null) {
+            FluxCore.receiveReject(3)
+            throw IOException("could not create $name in Downloads")
+        }
+        val pfd = try {
+            resolver.openFileDescriptor(uri, "w")
+        } catch (e: Exception) {
+            null
+        }
+        if (pfd == null) {
+            FluxCore.receiveReject(3)
+            resolver.delete(uri, null, null)
+            throw IOException("could not open $name for writing")
+        }
+        try {
+            FluxCore.receiveBody(pfd.detachFd())
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            throw e
         }
         values.clear()
         values.put(MediaStore.Downloads.IS_PENDING, 0)
         resolver.update(uri, values, null, null)
-        source.delete()
-        return Received(source.name, uri, mime)
+        val item = Received(displayNameOf(uri) ?: name, uri, mime)
+        received.add(0, item)
+        log("Received ${item.name}", item = item)
+        Notifications.done(context, "Received ${item.name}")
     }
 
     private fun allowedToInstall(): Boolean {
@@ -482,37 +605,45 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
         val previous = receiving
         previous?.cancel()
         FluxCore.cancel(1)
+        val mine = ++sessionId
+        receivingActive = true
+        refreshService()
         receiving = scope.launch(Dispatchers.IO) {
-            previous?.join()
-            FluxCore.reset(1)
-            val port = try {
-                FluxCore.bindReceiver()
-            } catch (e: Exception) {
-                error = e.message
-                return@launch
-            }
-            val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
-            addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
-            launch { announce(Build.MODEL, port) }
-            launch { trackReceive() }
-            val dir = File(context.cacheDir, "incoming").apply { mkdirs() }.path
-            while (isActive) {
-                try {
-                    val saved = File(FluxCore.receiveOne(dir))
-                    val item = publish(saved)
-                    received.add(0, item)
-                    recent.add(0, "Received ${item.name}")
+            try {
+                previous?.join()
+                FluxCore.reset(1)
+                val port = try {
+                    FluxCore.bindReceiver()
                 } catch (e: Exception) {
-                    if (isActive) {
-                        error = e.message
-                        delay(500)
+                    error = e.message
+                    return@launch
+                }
+                val ips = lanAddresses().ifEmpty { listOf(FluxCore.localIp()).filter { it.isNotEmpty() } }
+                addresses = ips.map { "$it:$port" }.ifEmpty { listOf("No network, port $port") }
+                launch { announce(Build.MODEL, port) }
+                launch { trackReceive() }
+                while (isActive) {
+                    try {
+                        receiveOne()
+                    } catch (e: Exception) {
+                        if (isActive) {
+                            error = e.message
+                            log("Receive failed: ${e.message}", ok = false)
+                            delay(500)
+                        }
                     }
+                }
+            } finally {
+                if (mine == sessionId) {
+                    receivingActive = false
+                    refreshService()
                 }
             }
         }
     }
 
     private suspend fun trackReceive() {
+        var lastNotify = 0L
         while (true) {
             delay(200)
             val total = FluxCore.progressTotal(1)
@@ -523,14 +654,26 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
             } else {
                 incomingName = ""
             }
+            val wall = System.currentTimeMillis()
+            if (!sending && wall - lastNotify > 1000) {
+                lastNotify = wall
+                if (incomingName.isNotEmpty()) {
+                    Notifications.update(context, "Receiving $incomingName", (incomingFraction * 100).toInt())
+                } else {
+                    Notifications.update(context, "Ready to receive", null)
+                }
+            }
         }
     }
 
     fun stopReceiving() {
+        sessionId++
         receiving?.cancel()
         receiving = null
         FluxCore.cancel(1)
+        receivingActive = false
         incomingName = ""
         screen = Screen.Home
+        refreshService()
     }
 }
