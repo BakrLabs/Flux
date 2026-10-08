@@ -11,11 +11,20 @@ android {
     compileSdk = 35
 
     signingConfigs {
-        getByName("debug") {
-            storeFile = rootProject.file("debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        create("release") {
+            val keystore = System.getenv("FLUX_KEYSTORE")
+            if (keystore != null) {
+                storeFile = file(keystore)
+                storePassword = System.getenv("FLUX_KEYSTORE_PASSWORD")
+                keyAlias = "flux"
+                keyPassword = System.getenv("FLUX_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

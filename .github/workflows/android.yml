@@ -34,17 +34,20 @@ jobs:
         with:
           gradle-version: 8.9
 
+      - name: Restore signing key
+        run: |
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/flux.keystore"
+          test -s "$RUNNER_TEMP/flux.keystore" || { echo "KEYSTORE_B64 secret is missing or empty"; exit 1; }
+
       - name: Build APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon -PversionCode=${{ github.run_number }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: flux-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+        env:
+          FLUX_KEYSTORE: ${{ runner.temp }}/flux.keystore
+          FLUX_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: gradle assembleRelease --no-daemon -PversionCode=${{ github.run_number }}
 
       - name: Rename APK
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk flux.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk flux.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
