@@ -52,6 +52,42 @@ import java.util.Locale
 import androidx.core.graphics.drawable.toBitmap
 
 @Composable
+fun PairingDialog(request: Pairing) {
+    AlertDialog(
+        onDismissRequest = { request.answer.complete(false) },
+        containerColor = Palette.card,
+        title = {
+            Text(
+                if (request.sending) "Verify the receiver" else "New device wants to send",
+                color = Palette.text,
+                fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(request.device, color = Palette.text, fontSize = 15.sp)
+                Text(request.code, color = Palette.accent, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "Both phones must show exactly this code. If they differ, someone may be intercepting the connection.",
+                    color = Palette.muted,
+                    fontSize = 13.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { request.answer.complete(true) }) {
+                Text(if (request.sending) "Codes match" else "Accept", color = Palette.accent, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { request.answer.complete(false) }) {
+                Text(if (request.sending) "Cancel" else "Decline", color = Palette.muted)
+            }
+        },
+    )
+}
+
+@Composable
 fun UpdateDialog(state: FluxState, info: UpdateInfo) {
     AlertDialog(
         onDismissRequest = { if (!state.updating) state.update = null },
@@ -435,6 +471,17 @@ fun HomeScreen(state: FluxState) {
                 .clickable { state.checkNow() }
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         )
+        if (state.pairedCount > 0) {
+            Text(
+                "Forget ${state.pairedCount} paired device(s)",
+                color = Palette.muted,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { state.forgetDevices() }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
+        }
     }
 }
 

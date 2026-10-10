@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 blake3 = "1"
+snow = "=0.9.6"
 tokio = { version = "1", features = ["fs", "io-util", "net", "time"] }

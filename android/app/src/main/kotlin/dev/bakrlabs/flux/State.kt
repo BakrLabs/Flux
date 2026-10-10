@@ -21,6 +21,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,6 +30,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -52,6 +54,13 @@ class Picked(val name: String, val uri: Uri? = null, val app: AppEntry? = null)
 private class Source(val pfd: ParcelFileDescriptor, val name: String, val size: Long)
 
 class Received(val name: String, val uri: Uri, val mime: String)
+
+class Pairing(
+    val device: String,
+    val code: String,
+    val sending: Boolean,
+    val answer: CompletableDeferred<Boolean>,
+)
 
 class HistoryEntry(
     val time: Long,
@@ -90,6 +99,8 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     val received = mutableStateListOf<Received>()
     val apps = mutableStateListOf<AppEntry>()
     var tab by mutableStateOf(0)
+    var pairing by mutableStateOf<Pairing?>(null)
+    var pairedCount by mutableStateOf(0)
     var update by mutableStateOf<UpdateInfo?>(null)
     var updating by mutableStateOf(false)
     var updateProgress by mutableStateOf(0f)
@@ -106,8 +117,43 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
     @Volatile
     private var sessionId = 0
 
+    private val trusted = mutableSetOf<String>()
+
     init {
         history.addAll(loadHistory())
+        trusted.addAll(prefs.getStringSet("trusted", emptySet()) ?: emptySet())
+        pairedCount = trusted.size
+        val key = prefs.getString("key", null) ?: FluxCore.generateKey().also {
+            prefs.edit().putString("key", it).apply()
+        }
+        FluxCore.setIdentity(key, Build.MODEL)
+    }
+
+    private fun trust(fingerprint: String) {
+        trusted.add(fingerprint)
+        pairedCount = trusted.size
+        prefs.edit().putStringSet("trusted", HashSet(trusted)).apply()
+    }
+
+    fun forgetDevices() {
+        trusted.clear()
+        pairedCount = 0
+        prefs.edit().remove("trusted").apply()
+    }
+
+    private suspend fun verify(info: String, sending: Boolean): Boolean {
+        val parts = info.split('\t')
+        val fingerprint = parts[0]
+        val code = parts.getOrElse(1) { "" }
+        val device = parts.getOrElse(2) { "Unknown device" }
+        if (fingerprint in trusted) return true
+        if (!sending) Notifications.done(context, "Open Flux to approve $device")
+        val request = Pairing(device, code, sending, CompletableDeferred())
+        pairing = request
+        val accepted = withTimeoutOrNull(180_000) { request.answer.await() } ?: false
+        pairing = null
+        if (accepted) trust(fingerprint)
+        return accepted
     }
 
     private fun loadHistory(): List<HistoryEntry> = runCatching {
@@ -215,9 +261,19 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
                     val scratch = mutableListOf<File>()
                     try {
                         val source = prepare(file, scratch)
+                        try {
+                            val peer = FluxCore.senderConnect(addr)
+                            if (!verify(peer, true)) {
+                                FluxCore.senderAbort()
+                                throw IOException("The connection was not verified")
+                            }
+                        } catch (e: Exception) {
+                            source.pfd.close()
+                            throw e
+                        }
                         item.status = "Sending"
                         val started = System.nanoTime()
-                        val bytes = FluxCore.sendFd(addr, source.name, source.size, source.pfd.detachFd())
+                        val bytes = FluxCore.sendFd(source.name, source.size, source.pfd.detachFd())
                         val seconds = (System.nanoTime() - started) / 1e9
                         speed = "%.1f MB/s".format(bytes / seconds / 1e6)
                         item.status = "Done"
@@ -389,8 +445,13 @@ class FluxState(private val context: Context, private val scope: CoroutineScope)
             .query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
             ?.use { if (it.moveToFirst()) it.getString(0) else null }
 
-    private fun receiveOne() {
-        val header = FluxCore.receiveHeader()
+    private suspend fun receiveOne() {
+        val peer = FluxCore.receiveAccept()
+        if (!verify(peer, false)) {
+            FluxCore.receiveReject(5)
+            throw IOException("Declined a transfer from an unverified device")
+        }
+        val header = FluxCore.receiveHello()
         val name = header.substringBeforeLast('\t')
         val size = header.substringAfterLast('\t').toLongOrNull() ?: 0L
         val free = StatFs((context.getExternalFilesDir(null) ?: context.filesDir).path).availableBytes

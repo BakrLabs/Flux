@@ -57,6 +57,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 state.update?.let { UpdateDialog(state, it) }
+                state.pairing?.let { PairingDialog(it) }
             }
         }
     }

@@ -6,13 +6,16 @@ object FluxCore {
     }
 
     external fun localIp(): String
+    external fun generateKey(): String
+    external fun setIdentity(key: String, name: String)
     external fun bindReceiver(): Int
-    external fun receiveOne(outDir: String): String
-    external fun receiveHeader(): String
+    external fun receiveAccept(): String
+    external fun receiveHello(): String
     external fun receiveBody(fd: Int): Long
     external fun receiveReject(code: Int)
-    external fun sendFile(addr: String, path: String): Long
-    external fun sendFd(addr: String, name: String, size: Long, fd: Int): Long
+    external fun senderConnect(addr: String): String
+    external fun senderAbort()
+    external fun sendFd(name: String, size: Long, fd: Int): Long
     external fun progressDone(channel: Int): Long
     external fun progressTotal(channel: Int): Long
     external fun progressName(channel: Int): String
